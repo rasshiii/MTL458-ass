@@ -1,20 +1,16 @@
 /*
-  entrynumber_a1.c
-  MTL458 Assignment 1 - Basic Shell
-  Features:
-    - Prompt: MTL458 >
-    - Execute commands via fork() + execvp()
-    - Single pipe support (cmd1 | cmd2)
-    - Single I/O redirection: <, >, >> (no pipes combined with redirection)
+  mini_shell.c
+  A compact interactive shell with:
+    - Prompt: msh$ 
+    - External commands via fork() + execvp()
+    - One pipeline segment (cmd1 | cmd2)
+    - Basic I/O redirection: <, >, >> (not combined with pipes)
     - Command separators: ; and && (&& executes next only on success)
-    - Wildcard expansion using glob()
+    - Globbing using glob()
     - Built-ins: cd, history, exit
-    - Command history up to 2048 entries (history and history n)
-    - Filename auto-completion via Tab (simple)
-    - Error message on invalid commands: "Invalid Command"
-  Notes:
-    - Does NOT use readline.
-    - Designed for POSIX (Linux). Use WSL / Cygwin / Linux VM to run on Windows.
+    - Command history up to 2048 entries (supports: history and history n)
+    - Simple Tab-based filename completion
+  Target: POSIX/Linux
 */
 
 #define _POSIX_C_SOURCE 200809L
@@ -85,26 +81,23 @@ int tokenize_args(char *line, char **argv) {
     while (*p) {
         while (isspace((unsigned char)*p)) p++;
         if (*p == '\0') break;
-        if (*p == '"') {
+        int in_quotes = 0;
+        char token_buf[MAXLINE];
+        int tlen = 0;
+        if (*p == '"') { in_quotes = 1; p++; }
+        while (*p) {
+            if (in_quotes) {
+                if (*p == '"') { p++; break; }
+            } else {
+                if (isspace((unsigned char)*p)) break;
+            }
+            if (tlen < MAXLINE - 1) token_buf[tlen++] = *p;
             p++;
-            char *start = p;
-            while (*p && *p != '"') p++;
-            int len = p - start;
-            argv[argc] = malloc(len + 1);
-            strncpy(argv[argc], start, len);
-            argv[argc][len] = '\0';
-            argc++;
-            if (*p == '"') p++;
-        } else {
-            char *start = p;
-            while (*p && !isspace((unsigned char)*p)) p++;
-            int len = p - start;
-            argv[argc] = malloc(len + 1);
-            strncpy(argv[argc], start, len);
-            argv[argc][len] = '\0';
-            argc++;
         }
+        token_buf[tlen] = '\0';
+        argv[argc++] = strdup(token_buf);
         if (argc >= MAXARGS) break;
+        while (*p && isspace((unsigned char)*p)) p++;
     }
     argv[argc] = NULL;
     return argc;
@@ -120,20 +113,21 @@ char **expand_wildcards(char **argv, int argc, int *new_argc) {
     char **out = malloc(sizeof(char*)*(MAXARGS+1));
     int outc = 0;
     for (int i = 0; i < argc; ++i) {
-        if (strchr(argv[i], '*') || strchr(argv[i], '?') || strchr(argv[i], '[')) {
+        const char *arg = argv[i];
+        if (strpbrk(arg, "*?[") != NULL) {
             glob_t results;
-            int g = glob(argv[i], 0, NULL, &results);
+            memset(&results, 0, sizeof(results));
+            int g = glob(arg, GLOB_NOCHECK, NULL, &results);
             if (g == 0) {
-                for (size_t j = 0; j < results.gl_pathc; ++j) {
+                for (size_t j = 0; j < results.gl_pathc && outc < MAXARGS; ++j) {
                     out[outc++] = strdup(results.gl_pathv[j]);
                 }
                 globfree(&results);
             } else {
-                // No matches: keep pattern as-is
-                out[outc++] = strdup(argv[i]);
+                out[outc++] = strdup(arg);
             }
         } else {
-            out[outc++] = strdup(argv[i]);
+            out[outc++] = strdup(arg);
         }
         if (outc >= MAXARGS) break;
     }
@@ -152,7 +146,6 @@ void free_expanded(char **arr, int cnt) {
 int execute_command(char **argv, int argc, int redirect_in_fd, int redirect_out_fd, int append_out) {
     if (argc == 0) return 0;
 
-    // Built-ins: cd, history, exit
     if (strcmp(argv[0], "cd") == 0) {
         if (argc < 2) {
             fprintf(stderr, "Invalid Command\n");
@@ -167,13 +160,13 @@ int execute_command(char **argv, int argc, int redirect_in_fd, int redirect_out_
         if (argc == 1) {
             do_history(0);
         } else {
-            // parse integer
-            int n = atoi(argv[1]);
-            do_history(n);
+            char *endptr = NULL;
+            long n = strtol(argv[1], &endptr, 10);
+            if (endptr == argv[1]) n = 0;
+            do_history((int)n);
         }
         return 0;
     } else if (strcmp(argv[0], "exit") == 0) {
-        // free history
         for (int i = 0; i < hist_count; ++i) free(history[i]);
         exit(0);
     }
@@ -183,7 +176,6 @@ int execute_command(char **argv, int argc, int redirect_in_fd, int redirect_out_
         perror("Invalid Command");
         return 1;
     } else if (pid == 0) {
-        // child
         if (redirect_in_fd >= 0) {
             dup2(redirect_in_fd, STDIN_FILENO);
             close(redirect_in_fd);
@@ -193,7 +185,6 @@ int execute_command(char **argv, int argc, int redirect_in_fd, int redirect_out_
             close(redirect_out_fd);
         }
         execvp(argv[0], argv);
-        // If exec fails:
         fprintf(stderr, "Invalid Command\n");
         _exit(127);
     } else {
@@ -212,27 +203,13 @@ int execute_pipe(char **left_argv, int left_argc, char **right_argv, int right_a
         return 1;
     }
 
-    pid_t p1 = fork();
-    if (p1 < 0) {
+    pid_t right_pid = fork();
+    if (right_pid < 0) {
         perror("Invalid Command");
-        return 1;
-    }
-    if (p1 == 0) {
-        // left child: write end -> stdout
-        dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[0]); close(pipefd[1]);
-        execvp(left_argv[0], left_argv);
-        fprintf(stderr, "Invalid Command\n");
-        _exit(127);
-    }
-
-    pid_t p2 = fork();
-    if (p2 < 0) {
-        perror("Invalid Command");
         return 1;
     }
-    if (p2 == 0) {
-        // right child: read end -> stdin
+    if (right_pid == 0) {
         dup2(pipefd[0], STDIN_FILENO);
         close(pipefd[0]); close(pipefd[1]);
         execvp(right_argv[0], right_argv);
@@ -240,36 +217,43 @@ int execute_pipe(char **left_argv, int left_argc, char **right_argv, int right_a
         _exit(127);
     }
 
-    // parent
+    pid_t left_pid = fork();
+    if (left_pid < 0) {
+        perror("Invalid Command");
+        close(pipefd[0]); close(pipefd[1]);
+        return 1;
+    }
+    if (left_pid == 0) {
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[0]); close(pipefd[1]);
+        execvp(left_argv[0], left_argv);
+        fprintf(stderr, "Invalid Command\n");
+        _exit(127);
+    }
+
     close(pipefd[0]); close(pipefd[1]);
-    int status1, status2;
-    waitpid(p1, &status1, 0);
-    waitpid(p2, &status2, 0);
-    if (WIFEXITED(status2)) return WEXITSTATUS(status2);
+    int status_left, status_right;
+    waitpid(left_pid, &status_left, 0);
+    waitpid(right_pid, &status_right, 0);
+    if (WIFEXITED(status_right)) return WEXITSTATUS(status_right);
     return 1;
 }
 
 /* Parse a single simple command (no pipes) for redirection. Returns 0 on success, fills argv_out & out_argc */
 int parse_redirection_and_build_args(char *cmd, char ***argv_out, int *out_argc,
                                      int *in_fd, int *out_fd, int *append_flag) {
-    // We'll tokenise, then detect <, >, >>
     char *copy = strdup(cmd);
-    char *tokens[MAXARGS];
-    int tcount = 0;
-    char *p = copy;
-    // naive split by whitespace but keep quoted handled by tokenize_args
     char *argv_tmp[MAXARGS];
     int argc_tmp = tokenize_args(copy, argv_tmp);
 
-    // prepare default fds
     *in_fd = -1; *out_fd = -1; *append_flag = 0;
 
-    // Scan for redirection tokens
     char **final_args = malloc(sizeof(char*)*(argc_tmp+1));
     int final_count = 0;
-    int i = 0;
-    while (i < argc_tmp) {
-        if (strcmp(argv_tmp[i], "<") == 0) {
+
+    for (int i = 0; i < argc_tmp; ++i) {
+        char *tok = argv_tmp[i];
+        if (tok[0] == '<' && tok[1] == '\0') {
             if (i+1 >= argc_tmp) {
                 free(copy);
                 free_argv(argv_tmp, argc_tmp);
@@ -278,28 +262,22 @@ int parse_redirection_and_build_args(char *cmd, char ***argv_out, int *out_argc,
             }
             int fd = open(argv_tmp[i+1], O_RDONLY);
             if (fd < 0) {
-                // file open error
                 free(copy);
                 free_argv(argv_tmp, argc_tmp);
                 free(final_args);
                 return -2;
             }
             *in_fd = fd;
-            i += 2;
-        } else if (strcmp(argv_tmp[i], ">") == 0 || strcmp(argv_tmp[i], ">>") == 0) {
-            int isappend = (strcmp(argv_tmp[i], ">>") == 0);
+            i++;
+        } else if ((tok[0] == '>' && tok[1] == '\0') || (tok[0] == '>' && tok[1] == '>' && tok[2] == '\0')) {
+            int isappend = (tok[1] == '>');
             if (i+1 >= argc_tmp) {
                 free(copy);
                 free_argv(argv_tmp, argc_tmp);
                 free(final_args);
                 return -1;
             }
-            int fd;
-            if (isappend) {
-                fd = open(argv_tmp[i+1], O_WRONLY | O_CREAT | O_APPEND, 0644);
-            } else {
-                fd = open(argv_tmp[i+1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            }
+            int fd = open(argv_tmp[i+1], O_WRONLY | O_CREAT | (isappend ? O_APPEND : O_TRUNC), 0644);
             if (fd < 0) {
                 free(copy);
                 free_argv(argv_tmp, argc_tmp);
@@ -308,19 +286,16 @@ int parse_redirection_and_build_args(char *cmd, char ***argv_out, int *out_argc,
             }
             *out_fd = fd;
             *append_flag = isappend;
-            i += 2;
-        } else {
-            final_args[final_count++] = strdup(argv_tmp[i]);
             i++;
+        } else {
+            final_args[final_count++] = strdup(tok);
         }
     }
     final_args[final_count] = NULL;
 
-    // expand wildcards
     int expanded_count;
     char **expanded = expand_wildcards(final_args, final_count, &expanded_count);
 
-    // cleanup
     free(copy);
     free_argv(argv_tmp, argc_tmp);
     for (int k = 0; k < final_count; ++k) free(final_args[k]);
@@ -338,13 +313,13 @@ char *read_line_with_tab() {
     struct termios orig_tio, raw_tio;
     tcgetattr(STDIN_FILENO, &orig_tio);
     raw_tio = orig_tio;
-    raw_tio.c_lflag &= ~(ICANON | ECHO); // disable canonical mode and echo
+    raw_tio.c_lflag &= ~(ICANON | ECHO);
     tcsetattr(STDIN_FILENO, TCSANOW, &raw_tio);
 
     char buf[MAXLINE];
     int len = 0;
     memset(buf, 0, sizeof(buf));
-    printf("MTL458 > ");
+    printf("msh$ ");
     fflush(stdout);
 
     while (1) {
@@ -357,46 +332,55 @@ char *read_line_with_tab() {
             buf[len] = '\0';
             putchar('\n');
             break;
-        } else if (c == 127 || c == 8) { // backspace
+        } else if (c == 127 || c == 8) {
             if (len > 0) {
                 len--;
-                // erase char from terminal
                 printf("\b \b");
                 fflush(stdout);
             }
         } else if (c == '\t') {
-            // perform tab completion: find current token start
             int i = len - 1;
             while (i >= 0 && !isspace((unsigned char)buf[i])) i--;
             int start = i + 1;
-            char prefix[512];
             int plen = len - start;
             if (plen <= 0) continue;
-            strncpy(prefix, buf + start, plen);
+            char prefix[512];
+            if (plen >= (int)sizeof(prefix)) continue;
+            memcpy(prefix, buf + start, plen);
             prefix[plen] = '\0';
 
-            // Use glob to find matches for prefix*
-            char pattern[1024];
-            snprintf(pattern, sizeof(pattern), "%s*", prefix);
-            glob_t results;
-            int g = glob(pattern, 0, NULL, &results);
-            if (g == 0 && results.gl_pathc == 1) {
-                // single match -> complete
-                char *match = results.gl_pathv[0];
-                int addlen = strlen(match) - plen;
+            DIR *dir = opendir(".");
+            if (!dir) continue;
+            int matches = 0;
+            char single[1024];
+            single[0] = '\0';
+            struct dirent *de;
+            while ((de = readdir(dir)) != NULL) {
+                if (strncmp(de->d_name, prefix, plen) == 0) {
+                    matches++;
+                    if (matches == 1) {
+                        strncpy(single, de->d_name, sizeof(single)-1);
+                        single[sizeof(single)-1] = '\0';
+                    } else {
+                        // more than one match -> do nothing
+                    }
+                    if (matches > 1) {
+                        // already more than one, no need to keep scanning strictly
+                    }
+                }
+            }
+            closedir(dir);
+            if (matches == 1) {
+                int addlen = (int)strlen(single) - plen;
                 if (addlen > 0) {
-                    // append to buffer and display
                     if (len + addlen >= MAXLINE - 1) addlen = MAXLINE - 1 - len;
-                    memcpy(buf + len, match + plen, addlen);
+                    memcpy(buf + len, single + plen, addlen);
                     len += addlen;
                     buf[len] = '\0';
-                    printf("%s", match + plen);
+                    printf("%s", single + plen);
                     fflush(stdout);
                 }
-            } else {
-                // multiple or zero matches: do nothing (could show list, but assignment not require)
             }
-            globfree(&results);
         } else {
             if (len < MAXLINE - 1) {
                 buf[len++] = (char)c;
@@ -417,47 +401,54 @@ char *read_line_with_tab() {
    The number of commands returned is stored in *count.
 */
 char **split_by_separators(char *line, int *count, int **sep_types) {
-    // We'll scan and split
-    char *s = line;
     int cap = 16;
     char **cmds = malloc(sizeof(char*)*cap);
     int *types = malloc(sizeof(int)*cap);
     int c = 0;
 
-    while (*s) {
-        // find next separator ; or &&
-        char *p = s;
-        char *next_sep = NULL;
-        int sep_type = 0;
-        while (*p) {
-            if (p[0] == ';') { next_sep = p; sep_type = 0; break; }
-            if (p[0] == '&' && p[1] == '&') { next_sep = p; sep_type = 1; break; }
-            p++;
-        }
-        if (next_sep) {
-            int len = next_sep - s;
-            char *piece = malloc(len+1);
-            strncpy(piece, s, len);
-            piece[len] = '\0';
-            cmds[c] = trim(piece);
-            types[c] = sep_type;
-            c++;
-            if (c >= cap) {
-                cap *= 2;
-                cmds = realloc(cmds, sizeof(char*)*cap);
-                types = realloc(types, sizeof(int)*cap);
+    int in_quotes = 0;
+    char *segment_start = line;
+
+    for (char *p = line; *p; ++p) {
+        if (*p == '"') in_quotes = !in_quotes;
+        if (!in_quotes) {
+            if (*p == ';') {
+                int len = p - segment_start;
+                char *piece = malloc(len + 1);
+                strncpy(piece, segment_start, len);
+                piece[len] = '\0';
+                cmds[c] = trim(piece);
+                types[c] = 0;
+                c++;
+                if (c >= cap) { cap *= 2; cmds = realloc(cmds, sizeof(char*)*cap); types = realloc(types, sizeof(int)*cap); }
+                segment_start = p + 1;
+                while (*segment_start && isspace((unsigned char)*segment_start)) segment_start++;
+            } else if (*p == '&' && *(p+1) == '&') {
+                int len = p - segment_start;
+                char *piece = malloc(len + 1);
+                strncpy(piece, segment_start, len);
+                piece[len] = '\0';
+                cmds[c] = trim(piece);
+                types[c] = 1;
+                c++;
+                if (c >= cap) { cap *= 2; cmds = realloc(cmds, sizeof(char*)*cap); types = realloc(types, sizeof(int)*cap); }
+                p++; // skip second '&'
+                segment_start = p + 1;
+                while (*segment_start && isspace((unsigned char)*segment_start)) segment_start++;
             }
-            if (sep_type == 1) s = next_sep + 2;
-            else s = next_sep + 1;
-            while (*s && isspace((unsigned char)*s)) s++;
-        } else {
-            // last piece
-            char *piece = strdup(s);
-            cmds[c] = trim(piece);
-            types[c] = 0;
-            c++;
-            break;
         }
+    }
+    if (*segment_start) {
+        char *piece = strdup(segment_start);
+        cmds[c] = trim(piece);
+        types[c] = 0;
+        c++;
+    } else {
+        // trailing separator -> add empty piece so loop logic remains consistent
+        char *piece = strdup("");
+        cmds[c] = piece;
+        types[c] = 0;
+        c++;
     }
     *count = c;
     *sep_types = types;
@@ -473,32 +464,34 @@ void free_split(char **cmds, int count, int *types) {
 
 /* Process a single command piece (may contain a pipe) and execute. Returns exit status. */
 int process_piece(char *piece) {
-    // Check for pipe '|'. Only single pipe supported.
-    char *pipe_pos = strchr(piece, '|');
+    // find '|' outside quotes
+    int in_quotes = 0;
+    char *p = piece;
+    char *pipe_pos = NULL;
+    for (; *p; ++p) {
+        if (*p == '"') in_quotes = !in_quotes;
+        if (!in_quotes && *p == '|') { pipe_pos = p; break; }
+    }
+
     if (pipe_pos) {
-        // left and right
         char *left = strndup(piece, pipe_pos - piece);
         char *right = strdup(pipe_pos + 1);
         left = trim(left); right = trim(right);
 
-        // parse redirection and build args for left and right (redirection not allowed with pipes per assumptions of assignment)
         char **left_argv; int left_argc;
         int in_fd_left, out_fd_left, append_left;
         if (parse_redirection_and_build_args(left, &left_argv, &left_argc, &in_fd_left, &out_fd_left, &append_left) != 0) {
-            // error in parsing
             free(left); free(right);
             return 1;
         }
         char **right_argv; int right_argc;
         int in_fd_right, out_fd_right, append_right;
         if (parse_redirection_and_build_args(right, &right_argv, &right_argc, &in_fd_right, &out_fd_right, &append_right) != 0) {
-            // error
             free(left); free(right);
             free_expanded(left_argv, left_argc);
             return 1;
         }
 
-        // We won't support redirection combined with pipe to simplify: if any redirection fds present, error
         if (in_fd_left >= 0 || out_fd_left >= 0 || in_fd_right >= 0 || out_fd_right >= 0) {
             fprintf(stderr, "Invalid Command\n");
             free(left); free(right);
@@ -507,7 +500,6 @@ int process_piece(char *piece) {
             return 1;
         }
 
-        // execute pipe
         int status = execute_pipe(left_argv, left_argc, right_argv, right_argc);
 
         free(left); free(right);
@@ -515,7 +507,6 @@ int process_piece(char *piece) {
         free_expanded(right_argv, right_argc);
         return status;
     } else {
-        // no pipe -> possibly redirection
         char **argv; int argc;
         int in_fd, out_fd, append_flag;
         int pr = parse_redirection_and_build_args(piece, &argv, &argc, &in_fd, &out_fd, &append_flag);
